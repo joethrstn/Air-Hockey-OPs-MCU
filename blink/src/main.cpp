@@ -1,6 +1,10 @@
 #include "Arduino.h"
 #include <Wire.h>
 
+#define HSD_MAX_TEMP 100.0 //Double check with datasheet
+//#define PAUSE_DISCHARGE LOW
+#define LED_FLASH_DELAY 1000
+
 #define LED_BUILTIN_DO PC13
 
 #define nRELAY_EN_DO PB7
@@ -22,19 +26,18 @@
 #define HSD_SNS_AI PA3
 
 #define CAP_VOLTAGE_AI PA6
-#define TABLE_RELAY_COIL_VOLTAGE_AI PA7
+#define HI_SIDE_COIL_VOLTAGE_AI PA7
 #define PRECHARGE_RELAY_COIL_VOLTAGE_AI PB0
 
 HardwareSerial Serial2(PA10,PA9);
 
 float HSD_get_current(){
   digitalWrite(HSD_SEL1_DO, 0);
-  return analogRead(HSD_SNS_AI)*5000/300; //5000=Ksns, 300=Rsns
+  return analogRead(HSD_SNS_AI)*5000/261; //5000=Ksns, 261=Rsns
 }
 float HSD_get_temperature(){
   digitalWrite(HSD_SEL1_DO, 1);
-  //return (analogRead(HSD_SNS_AI)*294.12)-50.147;
-  return (analogRead(HSD_SNS_AI)-0.5683)/0.0112;
+  return (((analogRead(HSD_SNS_AI)*3.3/1023)-0.1483)/0.0029); //5000=Ksns, 261=Rsns
 }
 void HSD_enable(){
   digitalWrite(HSD_EN_DO, 1);
@@ -49,12 +52,45 @@ void HSD_retry_after_faults(){
   digitalWrite(HSD_LATCH_DO, 0);
 }
 
-float get_table_relay_coil_voltage(){
-  return analogRead(TABLE_RELAY_COIL_VOLTAGE_AI)*3.3*7.9/1023;
+float get_high_side_relay_coil_voltage(){
+  return analogRead(HI_SIDE_COIL_VOLTAGE_AI)*3.3*7.9/1023;
 }
 float get_precharge_relay_coil_voltage(){
   return analogRead(PRECHARGE_RELAY_COIL_VOLTAGE_AI)*3.3*7.9/1023;
 }
+
+float get_capacitor_voltage(){
+  return analogRead(CAP_VOLTAGE_AI)*3.3*7.9/1023;
+}
+
+enum hw_state{
+  SW_PRECHARGE,
+  SW_RUN,
+  SW_OFF
+};
+
+hw_state get_hardware_state(){
+  hw_state current_hw_state = SW_PRECHARGE;
+  if(get_precharge_relay_coil_voltage()<20 && get_precharge_relay_coil_voltage()<20 && 
+    get_high_side_relay_coil_voltage()<20 && get_high_side_relay_coil_voltage()<20){ //2 reads to debounce in transition
+    current_hw_state = SW_OFF;
+  }
+  else if(get_high_side_relay_coil_voltage()>20){
+    current_hw_state = SW_RUN;
+  }
+  else if(get_precharge_relay_coil_voltage()>20){
+    current_hw_state = SW_PRECHARGE; 
+  }
+  return current_hw_state;
+}
+
+enum state{
+  INIT,
+  PRECHARGE,
+  WAIT_TO_RUN,
+  RUN,
+  FAULT
+};
 
 enum color{
   BLACK,
@@ -119,35 +155,168 @@ void setLED(color LEDcolor){
   digitalWrite(LED_BLUE_DO, blue_state);
 }
 
+state state_machine_transition(state local_current_state){
+  bool hsd_fault = HSD_get_temperature()>HSD_MAX_TEMP; //TODO catch HSD self-turnoff
+  bool loop_fault = get_hardware_state() == SW_OFF;
+  bool is_faulted = hsd_fault || loop_fault;
+  state local_new_state = local_current_state;
+  switch(local_current_state){ //state machine transition logic
+    case INIT:
+      if(get_hardware_state() == SW_PRECHARGE){
+        local_new_state = PRECHARGE;
+      }
+    break;
+    case PRECHARGE:
+      if(is_faulted || get_hardware_state() != SW_PRECHARGE){
+        local_new_state = FAULT;
+      }
+      else if(get_capacitor_voltage()>23){
+        local_new_state = WAIT_TO_RUN;
+      }
+    break;
+    case WAIT_TO_RUN:
+      if(is_faulted){
+        local_new_state = FAULT;
+      }
+      else if(get_hardware_state() == SW_RUN){
+        local_new_state = RUN;
+      }
+    break;
+    case RUN:
+      if(is_faulted || get_hardware_state() != SW_RUN){
+        local_new_state = FAULT;
+      }
+    break;
+    case FAULT:
+      //code here if we want to exit fault 
+    break;
+  }
+  //Serial2.println(local_new_state);
+  return local_new_state;
+}
+
+state current_state = INIT;
+state new_state = INIT;
+bool did_transition = false;
+int start_millis;
+bool light_state = false;
+bool cap_fault = false;
+bool hsd_fault = false;
+bool loop_fault = false;
+
 void setup()
 {
   Serial2.begin(9600);
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(nRELAY_EN_DO, OUTPUT);
   pinMode(PAUSE_DISCHARGE_DO, OUTPUT);
-
   pinMode(LED_RED_DO, OUTPUT);
   pinMode(LED_GREEN_DO, OUTPUT);
   pinMode(LED_BLUE_DO, OUTPUT);
+  pinMode(nHIT_LIMIT_DI, INPUT);
+  pinMode(PRECHARGE_EN_DO, OUTPUT);
+  pinMode(RUN_RELAY_EN_DO, OUTPUT);
+  pinMode(TABLE_IS_OPERATIONAL_DO, OUTPUT);
+  pinMode(GAME_IS_ON_DO, OUTPUT);
+  pinMode(HSD_EN_DO, OUTPUT);
+  pinMode(HSD_LATCH_DO, OUTPUT);
+  pinMode(HSD_SEL1_DO, OUTPUT);
 
-  digitalWrite(nRELAY_EN_DO, LOW);
-  digitalWrite(PAUSE_DISCHARGE_DO, HIGH);
-  digitalWrite(PRECHARGE_EN_DO, 1);
-  digitalWrite(RUN_RELAY_EN_DO, 1);
-  HSD_enable();
+  digitalWrite(nRELAY_EN_DO, LOW); //Set SW shdn to ok state
+  digitalWrite(PAUSE_DISCHARGE_DO, LOW); //Do not pause discharge during a loop-open event
+  digitalWrite(PRECHARGE_EN_DO, LOW); //Open precharge relay
+  digitalWrite(RUN_RELAY_EN_DO, LOW); //Open run relay
+  HSD_retry_after_faults();
 }
 
 void loop()
 {
-  setLED(WHITE);
-  Serial2.println(HSD_get_current());
-  delay(1000);
-  setLED(RED);
-  Serial2.println(HSD_get_temperature());
-  delay(1000);
-  setLED(BLACK);
-  Serial2.println("Black");
-  delay(1000);
-
+  if(current_state != FAULT){
+    Serial2.println(current_state);
+  }
+  //Serial2.println(digitalRead(TABLE_IS_OPERATIONAL_DO));
+  new_state = state_machine_transition(current_state); //check if state transition is required
+  //Serial2.println(new_state);
+  did_transition = (new_state != current_state);
+  if(did_transition){ //run on exit blocks
+    switch(current_state){
+      case INIT:
+        //do nothing
+      break;
+      case PRECHARGE:
+        //do nothing
+      break;
+      case WAIT_TO_RUN:
+        digitalWrite(PRECHARGE_EN_DO, LOW); //Open precharge relay
+      break;
+      case RUN:
+        digitalWrite(RUN_RELAY_EN_DO, LOW); //Open run relay
+        digitalWrite(TABLE_IS_OPERATIONAL_DO, LOW); //Tell controls processor that table is not ready to go
+      break;
+      case FAULT:
+        //do nothing?
+      break;
+    }
+  }
+  current_state = new_state; //state transition
+  if(did_transition){ //run on entry blocks
+    switch(current_state){
+      case INIT:
+        //only run for re-entry to the init state, not power-up
+      break;
+      case PRECHARGE:
+        digitalWrite(PRECHARGE_EN_DO, HIGH); //Close precharge relay
+        HSD_enable();
+      break;
+      case WAIT_TO_RUN:
+        start_millis = millis();
+      break;
+      case RUN:
+        digitalWrite(RUN_RELAY_EN_DO, HIGH); //Close run relay
+        digitalWrite(TABLE_IS_OPERATIONAL_DO, HIGH); //Tell controls processor that table is ready to go
+      break;
+      case FAULT:
+        HSD_disable();
+        /*if(cap_fault){
+          setLED(PURPLE); //TODO 
+        }
+        if(hsd_fault){
+          setLED(BLUE);
+        }
+        if(get_hardware_state() == SW_OFF){
+          setLED(RED);
+        }*/
+      break;
+    }
+  }
+  switch(current_state){ //run on loop blocks
+    case INIT:
+      setLED(WHITE);
+    break;
+    case PRECHARGE:
+      setLED(YELLOW);
+    break;
+    case WAIT_TO_RUN:
+      if(millis()>start_millis+LED_FLASH_DELAY){ //flash RGB in green, black state
+        if(!light_state){
+          setLED(GREEN);
+          start_millis = millis();
+          light_state = true;
+        }
+        else{
+          setLED(BLACK);
+          start_millis = millis();
+          light_state = false;
+        }
+      }
+    break;
+    case RUN:
+      setLED(GREEN);
+    break;
+    case FAULT:
+      setLED(RED);
+      digitalWrite(nRELAY_EN_DO, HIGH);
+    break;
+  } 
 }
 
