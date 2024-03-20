@@ -1,8 +1,9 @@
 #include "Arduino.h"
 #include <Wire.h>
 
-#define HSD_MAX_TEMP 100.0 //Double check with datasheet
-#define HSD_MAX_CURRENT 50.0 //Double check with Altium configuration
+#define HSD_MAX_TEMP 140.0 //Double check with datasheet
+#define HSD_MAX_CURRENT 60.0 //Double check with Altium configuration
+#define MIN_CAP_VOLTAGE 22.0
 #define LED_FLASH_DELAY 500
 
 #define LED_BUILTIN_DO PC13
@@ -39,9 +40,14 @@ bool hsd_temp_fault = false;
 bool hsd_current_fault = false;
 bool loop_fault = false;
 
+bool latched_cap_fault = false;
+bool latched_hsd_temp_fault = false;
+bool latched_hsd_current_fault = false;
+bool latched_loop_fault = false;
+
 float HSD_get_current(){
   digitalWrite(HSD_SEL1_DO, 0);
-  return analogRead(HSD_SNS_AI)*5000/261; //5000=Ksns, 261=Rsns
+  return analogRead(HSD_SNS_AI)*3.3*5000/(261*1023); //5000=Ksns, 261=Rsns
 }
 float HSD_get_temperature(){
   digitalWrite(HSD_SEL1_DO, 1);
@@ -166,13 +172,16 @@ state state_machine_transition(state local_current_state){
   hsd_temp_fault = HSD_get_temperature()>HSD_MAX_TEMP; //TODO catch HSD self-turnoff
   hsd_current_fault = HSD_get_current()>HSD_MAX_CURRENT;
   loop_fault = get_hardware_state() == SW_OFF;
-  cap_fault = get_capacitor_voltage()<22 && (local_current_state == RUN || local_current_state == WAIT_TO_RUN);
+  cap_fault = get_capacitor_voltage()<MIN_CAP_VOLTAGE && (local_current_state == RUN || local_current_state == WAIT_TO_RUN);
   bool is_faulted = hsd_temp_fault || hsd_current_fault || loop_fault || cap_fault;
   state local_new_state = local_current_state;
   switch(local_current_state){ //state machine transition logic
     case INIT:
       if(get_hardware_state() == SW_PRECHARGE){
         local_new_state = PRECHARGE;
+      }
+      if(is_faulted){
+        local_new_state = FAULT;
       }
     break;
     case PRECHARGE:
@@ -233,8 +242,22 @@ void setup()
   HSD_retry_after_faults();
 }
 
-void loop()
-{
+void loop() {
+  Serial2.print("HSD Current: ");
+  Serial2.println(HSD_get_current());
+  if(cap_fault){
+    latched_cap_fault = true;
+  }
+  if(hsd_temp_fault){
+    latched_hsd_temp_fault = true;
+  }
+  if(hsd_current_fault){
+    latched_hsd_current_fault = true;
+  }
+  if(loop_fault){
+    latched_loop_fault = true;
+  }
+
   new_state = state_machine_transition(current_state); //check if state transition is required
   did_transition = (new_state != current_state);
   if(did_transition){ //run on exit blocks
@@ -304,7 +327,19 @@ void loop()
     case RUN:
       setLED(GREEN);
     break;
-    case FAULT:
+    case FAULT:    
+      Serial2.print("Current Faults: ");
+      Serial2.print(cap_fault);
+      Serial2.print(hsd_temp_fault);
+      Serial2.print(hsd_current_fault);
+      Serial2.println(loop_fault);
+
+      Serial2.print("Latched Faults: ");
+      Serial2.print(latched_cap_fault);
+      Serial2.print(latched_hsd_temp_fault);
+      Serial2.print(latched_hsd_current_fault);
+      Serial2.println(latched_loop_fault);
+      
       if(cap_fault){
           setLED(BLUE); //TODO
           digitalWrite(nRELAY_EN_DO, HIGH);
@@ -316,6 +351,9 @@ void loop()
       else if(loop_fault){
         setLED(RED);
         digitalWrite(nRELAY_EN_DO, LOW);
+      }
+      else{
+        setLED(CYAN);
       }
     break;
   } 
