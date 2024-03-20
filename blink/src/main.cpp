@@ -2,8 +2,8 @@
 #include <Wire.h>
 
 #define HSD_MAX_TEMP 100.0 //Double check with datasheet
-//#define PAUSE_DISCHARGE LOW
-#define LED_FLASH_DELAY 1000
+#define HSD_MAX_CURRENT 50.0 //Double check with Altium configuration
+#define LED_FLASH_DELAY 500
 
 #define LED_BUILTIN_DO PC13
 
@@ -30,6 +30,14 @@
 #define PRECHARGE_RELAY_COIL_VOLTAGE_AI PB0
 
 HardwareSerial Serial2(PA10,PA9);
+
+bool did_transition = false;
+int start_millis;
+bool light_state = false;
+bool cap_fault = false;
+bool hsd_temp_fault = false;
+bool hsd_current_fault = false;
+bool loop_fault = false;
 
 float HSD_get_current(){
   digitalWrite(HSD_SEL1_DO, 0);
@@ -58,7 +66,6 @@ float get_high_side_relay_coil_voltage(){
 float get_precharge_relay_coil_voltage(){
   return analogRead(PRECHARGE_RELAY_COIL_VOLTAGE_AI)*3.3*7.9/1023;
 }
-
 float get_capacitor_voltage(){
   return analogRead(CAP_VOLTAGE_AI)*3.3*7.9/1023;
 }
@@ -156,9 +163,11 @@ void setLED(color LEDcolor){
 }
 
 state state_machine_transition(state local_current_state){
-  bool hsd_fault = HSD_get_temperature()>HSD_MAX_TEMP; //TODO catch HSD self-turnoff
-  bool loop_fault = get_hardware_state() == SW_OFF;
-  bool is_faulted = hsd_fault || loop_fault;
+  hsd_temp_fault = HSD_get_temperature()>HSD_MAX_TEMP; //TODO catch HSD self-turnoff
+  hsd_current_fault = HSD_get_current()>HSD_MAX_CURRENT;
+  loop_fault = get_hardware_state() == SW_OFF;
+  cap_fault = get_capacitor_voltage()<22 && (local_current_state == RUN || local_current_state == WAIT_TO_RUN);
+  bool is_faulted = hsd_temp_fault || hsd_current_fault || loop_fault || cap_fault;
   state local_new_state = local_current_state;
   switch(local_current_state){ //state machine transition logic
     case INIT:
@@ -170,7 +179,7 @@ state state_machine_transition(state local_current_state){
       if(is_faulted || get_hardware_state() != SW_PRECHARGE){
         local_new_state = FAULT;
       }
-      else if(get_capacitor_voltage()>23){
+      else if(get_capacitor_voltage()>23.5){
         local_new_state = WAIT_TO_RUN;
       }
     break;
@@ -188,21 +197,16 @@ state state_machine_transition(state local_current_state){
       }
     break;
     case FAULT:
-      //code here if we want to exit fault 
+      if(!is_faulted){
+        local_new_state = INIT;
+      }
     break;
   }
-  //Serial2.println(local_new_state);
   return local_new_state;
 }
 
 state current_state = INIT;
 state new_state = INIT;
-bool did_transition = false;
-int start_millis;
-bool light_state = false;
-bool cap_fault = false;
-bool hsd_fault = false;
-bool loop_fault = false;
 
 void setup()
 {
@@ -223,7 +227,7 @@ void setup()
   pinMode(HSD_SEL1_DO, OUTPUT);
 
   digitalWrite(nRELAY_EN_DO, LOW); //Set SW shdn to ok state
-  digitalWrite(PAUSE_DISCHARGE_DO, LOW); //Do not pause discharge during a loop-open event
+  digitalWrite(PAUSE_DISCHARGE_DO, HIGH); //Do not pause discharge during a loop-open event
   digitalWrite(PRECHARGE_EN_DO, LOW); //Open precharge relay
   digitalWrite(RUN_RELAY_EN_DO, LOW); //Open run relay
   HSD_retry_after_faults();
@@ -231,12 +235,7 @@ void setup()
 
 void loop()
 {
-  if(current_state != FAULT){
-    Serial2.println(current_state);
-  }
-  //Serial2.println(digitalRead(TABLE_IS_OPERATIONAL_DO));
   new_state = state_machine_transition(current_state); //check if state transition is required
-  //Serial2.println(new_state);
   did_transition = (new_state != current_state);
   if(did_transition){ //run on exit blocks
     switch(current_state){
@@ -262,7 +261,8 @@ void loop()
   if(did_transition){ //run on entry blocks
     switch(current_state){
       case INIT:
-        //only run for re-entry to the init state, not power-up
+        digitalWrite(PRECHARGE_EN_DO, LOW); //Open precharge relay
+        digitalWrite(RUN_RELAY_EN_DO, LOW); //Open run relay
       break;
       case PRECHARGE:
         digitalWrite(PRECHARGE_EN_DO, HIGH); //Close precharge relay
@@ -277,15 +277,6 @@ void loop()
       break;
       case FAULT:
         HSD_disable();
-        /*if(cap_fault){
-          setLED(PURPLE); //TODO 
-        }
-        if(hsd_fault){
-          setLED(BLUE);
-        }
-        if(get_hardware_state() == SW_OFF){
-          setLED(RED);
-        }*/
       break;
     }
   }
@@ -314,8 +305,18 @@ void loop()
       setLED(GREEN);
     break;
     case FAULT:
-      setLED(RED);
-      digitalWrite(nRELAY_EN_DO, HIGH);
+      if(cap_fault){
+          setLED(BLUE); //TODO
+          digitalWrite(nRELAY_EN_DO, HIGH);
+        }
+      else if(hsd_temp_fault || hsd_current_fault){
+        setLED(PURPLE);
+        digitalWrite(nRELAY_EN_DO, HIGH);
+      }
+      else if(loop_fault){
+        setLED(RED);
+        digitalWrite(nRELAY_EN_DO, LOW);
+      }
     break;
   } 
 }
